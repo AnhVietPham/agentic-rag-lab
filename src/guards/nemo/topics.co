@@ -1,0 +1,36 @@
+# Colang — Allowed topic definitions and output rails
+# Defines the system's domain and output safety checks
+
+define user ask ml research
+  "explain this paper"
+  "what is machine learning"
+  "how does deep learning work"
+  "what are transformers"
+  "summarize the paper"
+  "compare these papers"
+  "latest research on large language models"
+  "arxiv paper about"
+  "what does this algorithm do"
+  "explain neural networks"
+  "what is reinforcement learning"
+  "how does RAG work"
+  "what is retrieval augmented generation"
+
+define bot provide research answer
+  "Based on the indexed research papers, here is what I found..."
+
+define flow answer ml questions
+  user ask ml research
+  bot provide research answer
+
+# -----------------------------------------------------------------------
+# Output rails — prevent the model from making unqualified claims
+
+define bot check output
+  "Note: The above information is based on academic research papers only."
+
+define flow check output for sensitive claims
+  bot ...
+  $has_financial = search("\\b(invest|stock|buy|sell|profit|return|portfolio)\\b", $last_bot_message)
+  if $has_financial
+    bot check output

@@ -1,0 +1,4 @@
+<!-- Fix "Listen [::]:8123 failed" when IPv6 is disabled in Docker (e.g. macOS). -->
+<clickhouse>
+    <listen_host>0.0.0.0</listen_host>
+</clickhouse>

@@ -1,0 +1,399 @@
+name: production-agentic-rag
+
+services:
+  api: 
+    build: .
+    container_name: production-agentic-rag-api
+    ports:
+      - 8001:8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health').read()\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    env_file:
+      - .env
+    environment:
+      - OPENSEARCH__HOST=http://opensearch:9200
+      - POSTGRES_DATABASE_URL=postgresql+psycopg2://production_agentic_rag_user:production_agentic_rag_password@postgres:5432/production_agentic_rag_db
+      - LANGFUSE_HOST=http://langfuse:3000
+      - REDIS_HOST=redis
+    networks:
+      - production-agentic-rag-network
+
+  redis:
+    image: redis:latest
+    container_name: production-agentic-rag-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - production-agentic-rag-network
+  
+  opensearch: 
+    image: opensearchproject/opensearch:2.19.0
+    container_name: production-agentic-rag-opensearch
+    environment: 
+      - discovery.type=single-node
+      - OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m
+      - DISABLE_SECURITY_PLUGIN=true
+      - bootstrap.memory_lock=true
+    ports:
+      - "9201:9200"
+      - "9600:9600"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - opensearch_data:/usr/share/opensearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+    networks:
+      - production-agentic-rag-network
+
+  opensearch-dashboards:
+    image: opensearchproject/opensearch-dashboards:2.19.0
+    container_name: production-agentic-rag-opensearch-dashboards
+    ports: 
+      - "5602:5601"
+    environment:
+      - OPENSEARCH_HOSTS=["http://opensearch:9200"]
+      - DISABLE_SECURITY_DASHBOARDS_PLUGIN=true
+    depends_on:
+      - opensearch
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:5601/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    networks:
+      - production-agentic-rag-network
+
+  airflow: 
+    build: 
+      context: ./airflow
+      dockerfile: Dockerfile
+    container_name: production-agentic-rag-airflow
+    depends_on: 
+      postgres: 
+        condition: service_healthy
+    env_file: 
+      - .env
+    environment:
+      - AIRFLOW_HOME=/opt/airflow
+      - AIRFLOW__CORE__AUTH_MANAGER=airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+      - PYTHONPATH=/opt/airflow/dags:/opt/airflow
+      - POSTGRES_DATABASE_URL=postgresql+psycopg2://production_agentic_rag_user:production_agentic_rag_password@postgres:5432/production_agentic_rag_db
+      - OPENSEARCH__HOST=http://opensearch:9200
+      - REDIS_HOST=redis
+      - HF_HOME=/opt/airflow/.cache/huggingface
+    volumes: 
+      - ./airflow/dags:/opt/airflow/dags
+      - airflow_logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+      - ./src:/opt/airflow/src
+      - ./data/arxiv_pdfs:/opt/airflow/data/arxiv_pdfs
+      - ./scripts:/opt/airflow/scripts
+      - airflow_hf_cache:/opt/airflow/.cache
+    ports: 
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    networks:
+      - production-agentic-rag-network
+
+  postgres:
+    image: postgres:16.2-alpine
+    container_name: production-agentic-rag-postgres
+    environment:
+      - POSTGRES_USER=production_agentic_rag_user
+      - POSTGRES_PASSWORD=production_agentic_rag_password
+      - POSTGRES_DB=production_agentic_rag_db
+      - POSTGRES_HOST_AUTH_METHOD=password
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U production_agentic_rag_user -d production_agentic_rag_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - production-agentic-rag-network
+
+  ollama:
+    image: ollama/ollama:0.11.2
+    container_name: production-agentic-rag-ollama
+    ports:
+      - "11435:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - production-agentic-rag-network
+
+  # ClickHouse — aligned with https://github.com/langfuse/langfuse/blob/main/docker-compose.yml
+  # Langfuse v3 creates `events_core` etc. in DB `default` via migrations on web/worker startup.
+  # After changing ClickHouse auth/DB, you MUST reset the volume once:
+  #   docker compose stop clickhouse langfuse-web langfuse-worker && docker volume rm production-agentic-rag_clickhouse_data_v2 && docker compose up -d clickhouse langfuse-web langfuse-worker
+  clickhouse:
+    image: docker.io/clickhouse/clickhouse-server:24.8
+    container_name: production-agentic-rag-clickhouse
+    user: "101:101"
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: clickhouse
+    volumes:
+      - clickhouse_data_v2:/var/lib/clickhouse
+      - ./docker/clickhouse/config.d/listen.xml:/etc/clickhouse-server/config.d/docker_listen.xml:ro
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://127.0.0.1:8123/ping || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 45s
+    restart: unless-stopped
+    networks:
+      - production-agentic-rag-network
+  
+  langfuse-worker: 
+    image: docker.io/langfuse/langfuse-worker:3
+    container_name: production-agentic-rag-langfuse-worker
+    restart: unless-stopped
+    depends_on:
+      langfuse-postgres: 
+        condition: service_healthy
+      langfuse-minio: 
+        condition: service_healthy
+      langfuse-redis:
+        condition: service_healthy
+      clickhouse: 
+        condition: service_healthy
+    ports: 
+      - "3030:3030"
+    environment: 
+      # Must match langfuse-web (http + same port) for local dev
+      NEXTAUTH_URL: http://localhost:3001
+      DATABASE_URL: postgresql://langfuse:langfuse@langfuse-postgres:5432/langfuse
+      # Security: Load sensitive values from .env file
+      SALT: ${LANGFUSE_SALT}
+      ENCRYPTION_KEY: ${LANGFUSE_ENCRYPTION_KEY}
+      LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: "true"
+      LANGFUSE_AUTO_CLICKHOUSE_MIGRATION_DISABLED: "false"
+      CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:clickhouse@clickhouse:9000/default
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: clickhouse
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      LANGFUSE_USE_AZURE_BLOB: "false"
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: ${LANGFUSE_MINIO_ACCESS_KEY}
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_MINIO_SECRET_KEY}
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://langfuse-minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: ${LANGFUSE_MINIO_ACCESS_KEY}
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_MINIO_SECRET_KEY}
+      # S3 API inside Docker network is always MinIO port 9000 (9090 is host-only publish)
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://langfuse-minio:9000
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: media/
+      REDIS_HOST: langfuse-redis
+      REDIS_PORT: 6379
+      REDIS_AUTH: ${LANGFUSE_REDIS_PASSWORD}
+      REDIS_TLS_ENABLED: "false"
+    networks:
+      - production-agentic-rag-network
+  
+  langfuse-web: 
+    image: docker.io/langfuse/langfuse:3
+    container_name: production-agentic-rag-langfuse-web
+    restart: unless-stopped
+    depends_on:
+      langfuse-postgres: 
+        condition: service_healthy
+      langfuse-minio: 
+        condition: service_healthy
+      langfuse-redis:
+        condition: service_healthy
+      clickhouse: 
+        condition: service_healthy
+    ports: 
+      - "3001:3000"
+    environment: 
+      NEXTAUTH_URL: http://localhost:3001
+      NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET}
+      DATABASE_URL: postgresql://langfuse:langfuse@langfuse-postgres:5432/langfuse
+      SALT: ${LANGFUSE_SALT}
+      ENCRYPTION_KEY: ${LANGFUSE_ENCRYPTION_KEY}
+      TELEMETRY_ENABLED: "false"
+      LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: "true"
+      LANGFUSE_AUTO_CLICKHOUSE_MIGRATION_DISABLED: "false"
+      CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:clickhouse@clickhouse:9000/default
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: clickhouse
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      LANGFUSE_USE_AZURE_BLOB: "false"
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: ${LANGFUSE_MINIO_ACCESS_KEY}
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_MINIO_SECRET_KEY}
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://langfuse-minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: ${LANGFUSE_MINIO_ACCESS_KEY}
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_MINIO_SECRET_KEY}
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://langfuse-minio:9000
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: media/
+      REDIS_HOST: langfuse-redis
+      REDIS_PORT: 6379
+      REDIS_AUTH: ${LANGFUSE_REDIS_PASSWORD}
+      REDIS_TLS_ENABLED: "false"
+      # Required by Langfuse v3 or other LANGFUSE_INIT_* vars are ignored (see web logs)
+      LANGFUSE_INIT_ORG_ID: "a1b2c3d4-e5f6-4789-a012-3456789abcde"
+      LANGFUSE_INIT_PROJECT_ID: "b2c3d4e5-f6a7-4890-b123-456789abcdef"
+      LANGFUSE_INIT_ORG_NAME: "RAG Organization"
+      LANGFUSE_INIT_PROJECT_NAME: "Agentic RAG"
+      LANGFUSE_INIT_USER_EMAIL: "admin@example.com"
+      LANGFUSE_INIT_USER_NAME: "Admin User"
+      LANGFUSE_INIT_USER_PASSWORD: "admin123"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3000/api/public/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    networks:
+      - production-agentic-rag-network
+  
+  langfuse-postgres:
+    image: postgres:17
+    container_name: production-agentic-rag-langfuse-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=langfuse
+      - POSTGRES_PASSWORD=langfuse
+      - POSTGRES_DB=langfuse
+      - POSTGRES_HOST_AUTH_METHOD=password
+      - TZ=UTC
+      - PGTZ=UTC
+    ports:
+      - "5434:5432"
+    volumes:
+      - langfuse_v3_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U langfuse -d langfuse"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+      start_period: 30s
+    networks:
+      - production-agentic-rag-network
+  
+  langfuse-redis:
+    image: docker.io/redis:7
+    container_name: production-agentic-rag-langfuse-redis
+    restart: unless-stopped
+    command: >
+      --requirepass langfuse_redis_password
+      --maxmemory-policy noeviction
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "langfuse_redis_password", "ping"]
+      interval: 3s
+      timeout: 10s
+      retries: 10
+    networks:
+      - production-agentic-rag-network
+  
+  langfuse-minio:
+    image: docker.io/minio/minio
+    container_name: production-agentic-rag-langfuse-minio
+    restart: unless-stopped
+    entrypoint: sh
+    command: -c 'mkdir -p /data/langfuse && minio server --address ":9000" --console-address ":9001" /data'
+    environment:
+      - MINIO_ROOT_USER=langfuse_minio
+      - MINIO_ROOT_PASSWORD=langfuse_minio_secret
+    ports:
+      - "9090:9000"
+      - "9091:9001"
+    volumes:
+      - langfuse_v3_minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    networks:
+      - production-agentic-rag-network
+
+volumes:
+  postgres_data:
+  opensearch_data:
+  ollama_data:
+  airflow_logs:
+  clickhouse_data_v2:
+  redis_data:
+  langfuse_v3_postgres_data:
+  langfuse_v3_minio_data:
+  airflow_hf_cache:
+  
+networks:
+  production-agentic-rag-network:
+    driver: bridge
+
+    

@@ -1,0 +1,34 @@
+# NeMo Guardrails — aligned with project OpenRouter settings (see src/config.py, .env.example).
+# Requires: nemoguardrails + OPENROUTER_API_KEY in the environment.
+#
+# Env vars (same names as the rest of the app):
+#   OPENROUTER_API_KEY   — required
+#   OPENROUTER_BASE_URL  — optional override (default https://openrouter.ai/api/v1)
+#   OPENROUTER_MODEL     — optional; if unset, use the `model` value below
+#
+# Note: YAML cannot read env for `model` / `openai_api_base`; change defaults here or load RailsConfig from code.
+
+models:
+  - type: main
+    engine: openai
+    # OpenRouter model slug (must match provider, e.g. openai/gpt-4o-mini)
+    model: openai/gpt-4o-mini
+    mode: chat
+    # Same secret as LLMClient / RAG — not OPENAI_API_KEY
+    api_key_env_var: OPENROUTER_API_KEY
+    parameters:
+      # OpenAI-compatible Chat Completions (same as Settings.openrouter_base_url)
+      openai_api_base: "https://openrouter.ai/api/v1"
+      temperature: 0.2
+      max_tokens: 1024
+
+# Active input/output rails (see topics.co, financial_policy.co)
+rails:
+  input:
+    flows:
+      - check financial advice
+      - check jailbreak attempt
+      - check off topic request
+  output:
+    flows:
+      - check output for sensitive claims
